@@ -30,7 +30,7 @@ All changes are written to standard, well-known locations (`/etc/sysctl.d/`, `sy
 ## Installation
 
 ```bash
-
+curl -fsSL https://raw.githubusercontent.com/samanamwowo/os-network-optimizer-Anti-DPI/refs/heads/main/optimize.sh -o optimize.sh && chmod +x optimize.sh && sudo ./optimize.sh
 ```
 
 After the first run, the tool installs itself as a global command:
