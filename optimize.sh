@@ -576,4 +576,20 @@ main_menu() {
         echo
 
         case "$choice" in
-            1) run_full_optimiz
+            1) run_full_optimization ;;
+            2) check_status ;;
+            3) run_uninstall ;;
+            4) echo -e "${GREEN}Goodbye.${NC}"; exit 0 ;;
+            *) log_err "Invalid option." ;;
+        esac
+
+        echo
+        read -rp "Press Enter to return to the menu..." _
+    done
+}
+
+# ============================================================
+#  Entry point
+# ============================================================
+check_root
+main_menu
