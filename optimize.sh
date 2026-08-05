@@ -403,7 +403,7 @@ run_full_optimization() {
     apply_traffic_shaping "$iface"
     echo
     log_ok "L3/L4 system optimizations applied successfully."
-    echo -e "${GREEN}${BOLD}Done. Use menu options 2-4 to add the Nginx honeypot, noise generator, or SSL tools.${NC}"
+    echo -e "${GREEN}${BOLD}Done. Use menu options 2-3 to add the Nginx honeypot or noise generator.${NC}"
 }
 
 # ============================================================
@@ -536,102 +536,7 @@ EOF
 }
 
 # ============================================================
-#  Section 4 (menu option 4): Certbot / SSL management
-# ============================================================
-install_certbot_if_needed() {
-    if ! command -v certbot >/dev/null 2>&1; then
-        log_info "Installing certbot..."
-        apt-get update -qq >/dev/null 2>&1
-        DEBIAN_FRONTEND=noninteractive apt-get install -y certbot >/dev/null 2>&1
-    fi
-}
-
-issue_single_domain_cert() {
-    check_root
-    install_certbot_if_needed
-    read -rp "Enter the domain (e.g. example.com): " domain
-    [[ -z "$domain" ]] && { log_err "Domain cannot be empty."; return 1; }
-    read -rp "Enter an admin email for renewal notices: " admin_email
-    [[ -z "$admin_email" ]] && admin_email="admin@${domain}"
-
-    log_info "Temporarily removing port 80 NAT redirect (if present) so certbot can bind port 80..."
-    iptables -t nat -D PREROUTING -p tcp --dport 80 -j REDIRECT --to-ports 8080 2>/dev/null
-
-    systemctl stop nginx >/dev/null 2>&1
-
-    if certbot certonly --standalone --non-interactive --agree-tos \
-        -m "$admin_email" -d "$domain"; then
-        log_ok "Certificate issued for $domain (see /etc/letsencrypt/live/$domain/)"
-    else
-        log_err "Certificate issuance failed. Check that port 80 is reachable from the internet and DNS for $domain points to this server."
-    fi
-
-    systemctl start nginx >/dev/null 2>&1
-    log_info "Restoring honeypot NAT redirect (if it was configured)..."
-    if [[ -f "$NGINX_CONF" ]]; then
-        iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-ports 8080 2>/dev/null
-        netfilter-persistent save >/dev/null 2>&1
-    fi
-}
-
-issue_wildcard_cert() {
-    check_root
-    install_certbot_if_needed
-    read -rp "Enter the apex domain for the wildcard (e.g. example.com): " domain
-    [[ -z "$domain" ]] && { log_err "Domain cannot be empty."; return 1; }
-    read -rp "Enter an admin email for renewal notices: " admin_email
-    [[ -z "$admin_email" ]] && admin_email="admin@${domain}"
-
-    log_warn "Wildcard certificates require DNS-01 validation. Certbot will pause"
-    log_warn "and ask you to create a TXT record at _acme-challenge.${domain}"
-    log_warn "in your DNS provider's control panel. Add it, wait for propagation, then press Enter in certbot."
-    echo
-
-    certbot certonly --manual --preferred-challenges dns \
-        --agree-tos -m "$admin_email" \
-        -d "$domain" -d "*.${domain}"
-
-    if [[ $? -eq 0 ]]; then
-        log_ok "Wildcard certificate issued for *.${domain}"
-    else
-        log_err "Wildcard certificate issuance failed or was cancelled."
-    fi
-}
-
-list_certificates() {
-    install_certbot_if_needed
-    certbot certificates
-}
-
-renew_all_certificates() {
-    check_root
-    install_certbot_if_needed
-    certbot renew
-}
-
-ssl_domain_menu() {
-    while true; do
-        echo
-        echo -e "${BOLD}-- Wildcard SSL & Domain Tools --${NC}"
-        echo -e "  ${CYAN}1)${NC} Issue certificate for a single domain (HTTP-01, automatic)"
-        echo -e "  ${CYAN}2)${NC} Issue wildcard certificate (DNS-01, manual TXT record)"
-        echo -e "  ${CYAN}3)${NC} List existing certificates"
-        echo -e "  ${CYAN}4)${NC} Renew all certificates"
-        echo -e "  ${CYAN}5)${NC} Back to main menu"
-        read -rp "Select [1-5]: " sub_choice
-        case "$sub_choice" in
-            1) issue_single_domain_cert ;;
-            2) issue_wildcard_cert ;;
-            3) list_certificates ;;
-            4) renew_all_certificates ;;
-            5) return 0 ;;
-            *) log_err "Invalid option." ;;
-        esac
-    done
-}
-
-# ============================================================
-#  Section 7: Status check (menu option 5)
+#  Section 7: Status check (menu option 4)
 # ============================================================
 check_status() {
     check_root
@@ -836,9 +741,6 @@ run_uninstall() {
     rm -rf "$STATE_DIR"
 
     echo
-    log_info "Note: TLS certificates issued via option 4 (certbot) are NOT removed automatically."
-    log_info "Run 'certbot delete' manually if you also want to remove issued certificates."
-    echo
     echo -e "${GREEN}${BOLD}System successfully restored to factory/default network settings.${NC}"
 }
 
@@ -852,22 +754,20 @@ main_menu() {
         echo -e "  ${CYAN}1)${NC} Apply Full System & Anti-DPI Optimizations (L3/L4 Tuning)"
         echo -e "  ${CYAN}2)${NC} Install Smart Active-Probing Honeypot (Nginx Layer 7 Defense)"
         echo -e "  ${CYAN}3)${NC} Deploy Background Noise Generator (Traffic Flattening)"
-        echo -e "  ${CYAN}4)${NC} Manage Wildcard SSL & Domain Tools (Certbot Integration)"
-        echo -e "  ${CYAN}5)${NC} Check System & DPI Defense Status"
-        echo -e "  ${CYAN}6)${NC} Uninstall & Restore Factory Defaults"
-        echo -e "  ${CYAN}7)${NC} Exit"
+        echo -e "  ${CYAN}4)${NC} Check System & DPI Defense Status"
+        echo -e "  ${CYAN}5)${NC} Uninstall & Restore Factory Defaults"
+        echo -e "  ${CYAN}6)${NC} Exit"
         echo -e "${BLUE}------------------------------------------------------------${NC}"
-        read -rp "$(echo -e "${BOLD}Select [1-7]: ${NC}")" choice
+        read -rp "$(echo -e "${BOLD}Select [1-6]: ${NC}")" choice
         echo
 
         case "$choice" in
             1) run_full_optimization ;;
             2) apply_probing_defense ;;
             3) deploy_noise_generator ;;
-            4) ssl_domain_menu ;;
-            5) check_status ;;
-            6) run_uninstall ;;
-            7) echo -e "${GREEN}Goodbye.${NC}"; exit 0 ;;
+            4) check_status ;;
+            5) run_uninstall ;;
+            6) echo -e "${GREEN}Goodbye.${NC}"; exit 0 ;;
             *) log_err "Invalid option." ;;
         esac
 
