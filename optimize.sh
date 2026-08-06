@@ -121,6 +121,30 @@ detect_resources() {
 }
 
 # ============================================================
+#  Snapshot current state before making changes (manual-rollback aid)
+# ============================================================
+backup_current_state() {
+    mkdir -p "${STATE_DIR}/backups"
+    local ts
+    ts=$(date +%Y%m%d-%H%M%S)
+    local sysctl_bak="${STATE_DIR}/backups/sysctl-${ts}.txt"
+    local iptables_bak="${STATE_DIR}/backups/iptables-${ts}.rules"
+
+    sysctl -a > "$sysctl_bak" 2>/dev/null
+    if command -v iptables-save >/dev/null 2>&1; then
+        iptables-save > "$iptables_bak" 2>/dev/null
+    fi
+
+    # Keep only the 5 most recent snapshots of each type to avoid unbounded growth
+    ls -1t "${STATE_DIR}"/backups/sysctl-*.txt 2>/dev/null | tail -n +6 | xargs -r rm -f
+    ls -1t "${STATE_DIR}"/backups/iptables-*.rules 2>/dev/null | tail -n +6 | xargs -r rm -f
+
+    log_info "Pre-change snapshot saved: $sysctl_bak"
+    log_info "                           $iptables_bak"
+    log_info "(for manual reference/diffing only - use option 5 'Uninstall' for a guaranteed clean revert)"
+}
+
+# ============================================================
 #  Install self as global command
 # ============================================================
 install_global_command() {
@@ -162,7 +186,6 @@ net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 
 # --- Reduce OS/network fingerprinting surface ---
-net.ipv4.tcp_timestamps = 0
 net.ipv4.ip_default_ttl = 128
 net.ipv4.conf.all.accept_redirects = 0
 net.ipv4.conf.all.send_redirects = 0
@@ -192,6 +215,38 @@ net.ipv4.tcp_rfc1337 = 1
 net.ipv4.ip_dynaddr = 1
 SYSCTL_EOF
 
+    if [[ "${DISABLE_TIMESTAMPS:-no}" == "yes" ]]; then
+        cat >> "$SYSCTL_FILE" << 'TS_EOF'
+
+# --- TCP timestamps disabled by user choice ---
+# Reduces one fingerprinting/uptime-disclosure vector, but on very high-speed
+# links (>1Gbps) it removes PAWS (Protection Against Wrapped Sequence numbers)
+# protection. Only disable this if you understand that tradeoff.
+net.ipv4.tcp_timestamps = 0
+TS_EOF
+        log_info "TCP timestamps: disabled (user opted in)"
+    else
+        cat >> "$SYSCTL_FILE" << 'TS_EOF'
+
+# --- TCP timestamps left at kernel default (enabled) ---
+# Disabling them removes a minor fingerprinting vector but can affect PAWS
+# protection on very high-speed links. Left on by default; re-run this option
+# and opt in if you specifically want them off.
+net.ipv4.tcp_timestamps = 1
+TS_EOF
+    fi
+
+    if [[ "${DISABLE_IPV6:-no}" == "yes" ]]; then
+        cat >> "$SYSCTL_FILE" << 'V6_EOF'
+
+# --- IPv6 disabled by user choice ---
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+V6_EOF
+        log_info "IPv6: disabled (user opted in)"
+    fi
+
     if sysctl --system >/tmp/antidpi_sysctl.log 2>&1; then
         log_ok "sysctl parameters applied ($SYSCTL_FILE)"
     else
@@ -203,8 +258,17 @@ SYSCTL_EOF
     if [[ "$current_cc" == "bbr" ]]; then
         log_ok "BBR congestion control is active"
     else
-        log_warn "BBR not active (current: $current_cc) - attempting to load tcp_bbr module"
+        log_warn "BBR not active (current: $current_cc) - checking module availability and attempting to load tcp_bbr"
+        if ! modinfo tcp_bbr >/dev/null 2>&1 && [[ ! -f /proc/config.gz ]]; then
+            log_warn "tcp_bbr module not found for this kernel ($(uname -r)) - BBR may not be supported here. Falling back to whatever the kernel default is."
+        fi
         modprobe tcp_bbr 2>/dev/null && sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1
+        current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
+        if [[ "$current_cc" == "bbr" ]]; then
+            log_ok "BBR successfully activated"
+        else
+            log_warn "Could not activate BBR on this kernel - continuing with '$current_cc' instead (non-fatal)"
+        fi
     fi
 }
 
@@ -246,7 +310,18 @@ run_kernel_hardening() {
     log_step "Starting core kernel hardening..."
     detect_iface >/dev/null
     detect_resources
+    backup_current_state
     echo
+
+    DISABLE_TIMESTAMPS="no"
+    read -rp "$(echo -e "${YELLOW}Disable TCP timestamps? Minor fingerprint reduction, but can affect PAWS protection on links above ~1Gbps. [y/N]: ${NC}")" ts_choice
+    [[ "$ts_choice" =~ ^[Yy]$ ]] && DISABLE_TIMESTAMPS="yes"
+
+    DISABLE_IPV6="no"
+    read -rp "$(echo -e "${YELLOW}Disable IPv6 entirely on this host? [y/N]: ${NC}")" v6_choice
+    [[ "$v6_choice" =~ ^[Yy]$ ]] && DISABLE_IPV6="yes"
+    echo
+
     install_global_command
     echo
     apply_kernel_tweaks
@@ -262,6 +337,17 @@ run_kernel_hardening() {
 apply_nic_tuning() {
     local iface="$1"
     log_step "Tuning NIC offload settings on interface: $iface"
+
+    if [[ "${CPU_CORES:-0}" -gt 0 && "${CPU_CORES}" -le 2 ]]; then
+        log_warn "This host has only ${CPU_CORES} CPU core(s). Disabling NIC offload (tso/gso/gro)"
+        log_warn "moves packet segmentation work from the network card to the CPU, which can"
+        log_warn "push a weak/shared vCPU to 100% under real traffic and cause instability."
+        read -rp "$(echo -e "${YELLOW}Proceed anyway? [y/N]: ${NC}")" offload_confirm
+        if [[ ! "$offload_confirm" =~ ^[Yy]$ ]]; then
+            log_info "Skipping NIC offload changes on this low-core host (nothing changed)."
+            return 0
+        fi
+    fi
 
     if ! command -v ethtool >/dev/null 2>&1; then
         log_info "Installing ethtool..."
@@ -299,20 +385,30 @@ EOF
 }
 
 apply_mss_clamp() {
-    log_step "Applying TCP MSS clamping (packet fragmentation resistance)..."
+    local mss_value="${1:-1360}"
+    log_step "Applying TCP MSS clamping (target: ${mss_value} bytes)..."
 
     if ! command -v iptables >/dev/null 2>&1; then
         apt-get update -qq >/dev/null 2>&1
         apt-get install -y iptables >/dev/null 2>&1
     fi
 
-    iptables -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 500 2>/dev/null || \
-        iptables -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 500
+    # Remove any MSS clamp this script previously added, in case the value changed
+    while IFS= read -r rule; do
+        [[ -z "$rule" ]] && continue
+        del_rule="${rule/-A FORWARD/-D FORWARD}"
+        eval "iptables $del_rule" 2>/dev/null
+    done < <(iptables -S FORWARD 2>/dev/null | grep -- "-j TCPMSS")
+    while IFS= read -r rule; do
+        [[ -z "$rule" ]] && continue
+        del_rule="${rule/-A OUTPUT/-D OUTPUT}"
+        eval "iptables $del_rule" 2>/dev/null
+    done < <(iptables -S OUTPUT 2>/dev/null | grep -- "-j TCPMSS")
 
-    iptables -C OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 500 2>/dev/null || \
-        iptables -A OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 500
+    iptables -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$mss_value"
+    iptables -A OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$mss_value"
 
-    log_ok "MSS clamped to 500 bytes on FORWARD/OUTPUT chains"
+    log_ok "MSS clamped to ${mss_value} bytes on FORWARD/OUTPUT chains"
 }
 
 apply_ttl_randomization() {
@@ -337,7 +433,8 @@ apply_ttl_randomization() {
 
 apply_traffic_shaping() {
     local iface="$1"
-    log_step "Applying traffic shaping (jitter) on interface: $iface"
+    local target_port="${2:-443}"
+    log_step "Applying traffic shaping (jitter) on interface: $iface, port: $target_port"
 
     if ! command -v tc >/dev/null 2>&1; then
         apt-get update -qq >/dev/null 2>&1
@@ -350,10 +447,10 @@ apply_traffic_shaping() {
     tc qdisc add dev "$iface" parent 1:3 handle 30: netem delay 10ms 5ms distribution normal
 
     tc filter add dev "$iface" protocol ip parent 1:0 prio 3 u32 \
-        match ip sport 80 0xffff flowid 1:3
+        match ip sport "$target_port" 0xffff flowid 1:3
 
     if [[ $? -eq 0 ]]; then
-        log_ok "Jitter (10ms +/- 5ms, normal distribution) applied to port 80 traffic on $iface"
+        log_ok "Jitter (10ms +/- 5ms, normal distribution) applied to port ${target_port} traffic on $iface"
     else
         log_warn "tc filter setup reported an issue (non-fatal, check 'tc qdisc show dev $iface')"
     fi
@@ -364,15 +461,35 @@ run_l3l4_manipulation() {
     log_step "Starting L3/L4 network manipulation..."
     local iface
     iface=$(get_tracked_iface)
+    detect_resources
+    backup_current_state
     log_info "Using interface: $iface"
     echo
+
+    local proxy_port
+    read -rp "$(echo -e "${YELLOW}Which port does your proxy/service actually run on? (the jitter targets this port) [443]: ${NC}")" proxy_port
+    proxy_port="${proxy_port:-443}"
+    if ! [[ "$proxy_port" =~ ^[0-9]+$ ]] || [[ "$proxy_port" -lt 1 || "$proxy_port" -gt 65535 ]]; then
+        log_warn "Invalid port '$proxy_port' - falling back to 443."
+        proxy_port=443
+    fi
+
+    local mss_value
+    read -rp "$(echo -e "${YELLOW}MSS clamp value in bytes (536-1460, lower = more fragmentation/overhead) [1360]: ${NC}")" mss_value
+    mss_value="${mss_value:-1360}"
+    if ! [[ "$mss_value" =~ ^[0-9]+$ ]] || [[ "$mss_value" -lt 536 || "$mss_value" -gt 1460 ]]; then
+        log_warn "Invalid MSS '$mss_value' - falling back to 1360."
+        mss_value=1360
+    fi
+    echo
+
     apply_nic_tuning "$iface"
     echo
-    apply_mss_clamp
+    apply_mss_clamp "$mss_value"
     echo
     apply_ttl_randomization
     echo
-    apply_traffic_shaping "$iface"
+    apply_traffic_shaping "$iface" "$proxy_port"
     echo
     log_ok "L3/L4 network manipulation applied successfully."
 }
@@ -382,6 +499,19 @@ run_l3l4_manipulation() {
 # ============================================================
 deploy_noise_generator() {
     check_root
+    log_warn "Honest disclosure before you enable this:"
+    log_warn "This traffic goes out as ordinary, separate connections from this host -"
+    log_warn "it is NOT injected into your proxy tunnel and does not disguise or pad"
+    log_warn "your tunnel's traffic in any way. A filterer analyzing your proxy's"
+    log_warn "connection sees it independently of this. The only thing this does is"
+    log_warn "keep the server's overall traffic graph from looking perfectly idle"
+    log_warn "between periods of real use - nothing more. It also uses a small"
+    log_warn "amount of bandwidth/CPU continuously."
+    read -rp "$(echo -e "${YELLOW}Deploy it anyway? [y/N]: ${NC}")" noise_confirm
+    if [[ ! "$noise_confirm" =~ ^[Yy]$ ]]; then
+        log_info "Skipping background noise generator (nothing changed)."
+        return 0
+    fi
     log_step "Deploying background traffic noise generator..."
 
     cat > "$NOISE_SCRIPT" << 'NOISE_EOF'
@@ -516,8 +646,10 @@ check_status() {
     echo
 
     echo -e "${BOLD}-- iptables rules --${NC}"
-    if iptables -S FORWARD 2>/dev/null | grep -q "TCPMSS"; then
-        log_ok "MSS clamping rule present (FORWARD)"
+    local current_mss
+    current_mss=$(iptables -S FORWARD 2>/dev/null | grep -oP '(?<=--set-mss )\d+' | head -n1)
+    if [[ -n "$current_mss" ]]; then
+        log_ok "MSS clamping rule present (FORWARD), value: ${current_mss} bytes"
     else
         log_warn "MSS clamping rule not found (FORWARD)"
     fi
@@ -605,8 +737,16 @@ run_uninstall() {
     log_ok "Noise generator removed"
 
     log_info "Removing iptables rules added by this script..."
-    iptables -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 500 2>/dev/null
-    iptables -D OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 500 2>/dev/null
+    while IFS= read -r rule; do
+        [[ -z "$rule" ]] && continue
+        del_rule="${rule/-A FORWARD/-D FORWARD}"
+        eval "iptables $del_rule" 2>/dev/null
+    done < <(iptables -S FORWARD 2>/dev/null | grep -- "-j TCPMSS")
+    while IFS= read -r rule; do
+        [[ -z "$rule" ]] && continue
+        del_rule="${rule/-A OUTPUT/-D OUTPUT}"
+        eval "iptables $del_rule" 2>/dev/null
+    done < <(iptables -S OUTPUT 2>/dev/null | grep -- "-j TCPMSS")
 
     while IFS= read -r rule; do
         [[ -z "$rule" ]] && continue
