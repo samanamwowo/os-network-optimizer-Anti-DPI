@@ -33,12 +33,92 @@ SELF_PATH="$(readlink -f "$0")"
 STATE_DIR="/etc/antidpi"
 STATE_IFACE_FILE="${STATE_DIR}/iface"
 STATE_TTL_FILE="${STATE_DIR}/ttl_value"
+UPDATE_URL="https://raw.githubusercontent.com/samanamwowo/os-network-optimizer-Anti-DPI/refs/heads/main/optimize.sh"
 
 log_info()  { echo -e "${CYAN}[INFO]${NC}  $1"; }
 log_ok()    { echo -e "${GREEN}[ OK ]${NC}  $1"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC}  $1"; }
 log_err()   { echo -e "${RED}[FAIL]${NC}  $1"; }
 log_step()  { echo -e "${MAGENTA}[STEP]${NC} ${BOLD}$1${NC}"; }
+
+# ============================================================
+#  Safe iptables rule removal (no eval - parses into an array instead)
+# ============================================================
+# Usage: safe_iptables_delete <table> <chain> <grep-pattern> [binary]
+# Finds every rule in <table>/<chain> matching <grep-pattern>, converts each
+# "-A <chain> ..." line into a real argv array, and deletes it with -D.
+# This avoids eval'ing a shell string built from command output.
+# [binary] defaults to "iptables"; pass "ip6tables" to operate on IPv6 rules.
+safe_iptables_delete() {
+    local table="$1" chain="$2" pattern="$3" binary="${4:-iptables}"
+    local rule_line
+    while IFS= read -r rule_line; do
+        [[ -z "$rule_line" ]] && continue
+        local rest="${rule_line#-A "$chain" }"
+        local -a args=()
+        read -ra args <<< "$rest"
+        "$binary" -t "$table" -D "$chain" "${args[@]}" 2>/dev/null
+    done < <("$binary" -t "$table" -S "$chain" 2>/dev/null | grep -- "$pattern")
+}
+
+# ============================================================
+#  Wait for a concurrent apt/dpkg process to finish (avoids silent
+#  install failures if unattended-upgrades or another apt run is active)
+# ============================================================
+wait_for_apt_lock() {
+    # Prefer fuser; fall back to lsof; fall back to a simple flock test-lock
+    # if neither exists, so this still does something useful everywhere.
+    if command -v fuser >/dev/null 2>&1; then
+        check_locked() { fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || fuser /var/lib/apt/lists/lock >/dev/null 2>&1; }
+    elif command -v lsof >/dev/null 2>&1; then
+        check_locked() { lsof /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || lsof /var/lib/apt/lists/lock >/dev/null 2>&1; }
+    elif command -v flock >/dev/null 2>&1; then
+        check_locked() { ! flock -n -x -w 0 /var/lib/dpkg/lock-frontend true 2>/dev/null; }
+    else
+        log_info "Neither fuser, lsof, nor flock is available - skipping apt lock check (proceeding directly)."
+        return 0
+    fi
+
+    local waited=0
+    local max_wait=60
+    while check_locked; do
+        if [[ "$waited" -eq 0 ]]; then
+            log_info "Another apt/dpkg process is running - waiting for it to finish..."
+        fi
+        sleep 3
+        waited=$((waited + 3))
+        if [[ "$waited" -ge "$max_wait" ]]; then
+            log_warn "apt/dpkg still locked after ${max_wait}s - proceeding anyway, install may fail."
+            break
+        fi
+    done
+}
+
+# ============================================================
+#  Persist current iptables/ip6tables rules across reboots.
+#  Installs iptables-persistent on first use (asks debconf non-interactively
+#  to not overwrite with a blank ruleset), then saves.
+# ============================================================
+persist_iptables_rules() {
+    if ! command -v netfilter-persistent >/dev/null 2>&1; then
+        wait_for_apt_lock
+        apt-get update -qq >/dev/null 2>&1
+        if command -v debconf-set-selections >/dev/null 2>&1; then
+            echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections 2>/dev/null
+            echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections 2>/dev/null
+        else
+            log_info "debconf-set-selections not found - relying on DEBIAN_FRONTEND=noninteractive alone (may still prompt on very minimal systems)."
+        fi
+        DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent >/dev/null 2>&1
+    fi
+
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+        netfilter-persistent save >/dev/null 2>&1
+        log_ok "iptables/ip6tables rules saved - will survive a reboot"
+    else
+        log_warn "Could not install iptables-persistent - rules were applied but will NOT survive a reboot. Install 'iptables-persistent' manually to fix this."
+    fi
+}
 
 # ============================================================
 #  Banner
@@ -69,6 +149,27 @@ check_root() {
         log_err "This script must be run as root. Try: sudo bash $0"
         exit 1
     fi
+}
+
+# ============================================================
+#  Warn (non-fatally) if not running on a supported distro
+# ============================================================
+check_distro() {
+    if [[ ! -f /etc/os-release ]]; then
+        log_warn "Could not detect the OS distribution (/etc/os-release missing). This script targets Ubuntu/Debian and uses apt-get - it will likely fail on other distros."
+        return 0
+    fi
+
+    local distro_id
+    distro_id=$(. /etc/os-release && echo "$ID")
+
+    case "$distro_id" in
+        ubuntu|debian) : ;;
+        *)
+            log_warn "Detected distro: '$distro_id'. This script is built and tested for Ubuntu/Debian only (it relies on apt-get, iptables-persistent, etc)."
+            log_warn "It may partially work or fail outright on other distros (RHEL/CentOS/Arch/etc). Proceed at your own risk."
+            ;;
+    esac
 }
 
 # ============================================================
@@ -286,6 +387,7 @@ apply_irq_balancing() {
     fi
 
     if ! command -v irqbalance >/dev/null 2>&1; then
+        wait_for_apt_lock
         apt-get update -qq >/dev/null 2>&1
         DEBIAN_FRONTEND=noninteractive apt-get install -y irqbalance >/dev/null 2>&1
     fi
@@ -305,6 +407,81 @@ apply_irq_balancing() {
     fi
 }
 
+# ============================================================
+#  Extra security sysctl module (separate file - fully optional/removable)
+# ============================================================
+EXTRA_SYSCTL_FILE="/etc/sysctl.d/99-antidpi-extra.conf"
+
+apply_extra_hardening() {
+    log_step "Applying extra security/performance sysctl module..."
+
+    cat > "$EXTRA_SYSCTL_FILE" << 'EXTRA_EOF'
+# Generated by Complete OS Anti-Filtering Optimization Script (Ultra Edition)
+# Fully separate, optional module - safe to delete this single file to revert
+# just these settings without touching the core module.
+
+# --- Reverse-path filtering: reject packets whose source address couldn't
+# --- have reached us via the interface they arrived on (basic anti-spoofing) ---
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+
+# --- Log "martian" packets (impossible/spoofed source addresses) for later review ---
+net.ipv4.conf.all.log_martians = 1
+
+# --- Don't reset the congestion window after an idle period; keeps a proxy
+# --- connection's throughput consistent instead of restarting slow-start
+# --- every time it goes quiet and resumes (typical of interactive proxy use) ---
+net.ipv4.tcp_slow_start_after_idle = 0
+
+# --- Let the kernel actively probe for a working MTU instead of relying
+# --- purely on ICMP (helps on paths that silently drop ICMP) ---
+net.ipv4.tcp_mtu_probing = 1
+EXTRA_EOF
+
+    if sysctl --system >/tmp/antidpi_sysctl_extra.log 2>&1; then
+        log_ok "Extra hardening applied ($EXTRA_SYSCTL_FILE)"
+    else
+        log_warn "sysctl --system reported issues for the extra module; see /tmp/antidpi_sysctl_extra.log (non-fatal)"
+    fi
+}
+
+# ============================================================
+#  IPv6 mirror module for MSS/TTL rules (separate, optional/removable)
+# ============================================================
+STATE_IPV6_MIRROR_FILE="${STATE_DIR}/ipv6_mirror_enabled"
+
+apply_ipv6_mirror() {
+    local mss_value="${1:-1360}"
+    log_step "Mirroring MSS clamping to IPv6 (ip6tables)..."
+
+    if [[ "${DISABLE_IPV6:-no}" == "yes" ]]; then
+        log_info "IPv6 is disabled on this host - skipping IPv6 rule mirroring (nothing to do)."
+        return 0
+    fi
+
+    if ! command -v ip6tables >/dev/null 2>&1; then
+        log_info "Installing ip6tables support..."
+        wait_for_apt_lock
+        apt-get update -qq >/dev/null 2>&1
+        apt-get install -y iptables >/dev/null 2>&1
+    fi
+
+    if ! command -v ip6tables >/dev/null 2>&1; then
+        log_warn "ip6tables not available on this system - IPv6 traffic will NOT receive the MSS clamp. Skipping (non-fatal)."
+        return 1
+    fi
+
+    safe_iptables_delete "filter" "FORWARD" "-j TCPMSS" "ip6tables"
+    safe_iptables_delete "filter" "OUTPUT" "-j TCPMSS" "ip6tables"
+
+    ip6tables -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$mss_value"
+    ip6tables -A OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$mss_value"
+
+    mkdir -p "$STATE_DIR"
+    touch "$STATE_IPV6_MIRROR_FILE"
+    log_ok "IPv6 MSS clamping mirrored (${mss_value} bytes) - IPv4-only rules were previously a gap"
+}
+
 run_kernel_hardening() {
     check_root
     log_step "Starting core kernel hardening..."
@@ -320,6 +497,10 @@ run_kernel_hardening() {
     DISABLE_IPV6="no"
     read -rp "$(echo -e "${YELLOW}Disable IPv6 entirely on this host? [y/N]: ${NC}")" v6_choice
     [[ "$v6_choice" =~ ^[Yy]$ ]] && DISABLE_IPV6="yes"
+
+    APPLY_EXTRA_HARDENING="no"
+    read -rp "$(echo -e "${YELLOW}Apply the extra hardening module too (anti-spoofing rp_filter, martian logging, idle-restart tuning)? Separate file, safe to skip. [Y/n]: ${NC}")" extra_choice
+    [[ ! "$extra_choice" =~ ^[Nn]$ ]] && APPLY_EXTRA_HARDENING="yes"
     echo
 
     install_global_command
@@ -328,6 +509,10 @@ run_kernel_hardening() {
     echo
     apply_irq_balancing
     echo
+    if [[ "$APPLY_EXTRA_HARDENING" == "yes" ]]; then
+        apply_extra_hardening
+        echo
+    fi
     log_ok "Core kernel hardening applied successfully."
 }
 
@@ -351,6 +536,7 @@ apply_nic_tuning() {
 
     if ! command -v ethtool >/dev/null 2>&1; then
         log_info "Installing ethtool..."
+        wait_for_apt_lock
         apt-get update -qq >/dev/null 2>&1
         apt-get install -y ethtool >/dev/null 2>&1
     fi
@@ -389,21 +575,14 @@ apply_mss_clamp() {
     log_step "Applying TCP MSS clamping (target: ${mss_value} bytes)..."
 
     if ! command -v iptables >/dev/null 2>&1; then
+        wait_for_apt_lock
         apt-get update -qq >/dev/null 2>&1
         apt-get install -y iptables >/dev/null 2>&1
     fi
 
     # Remove any MSS clamp this script previously added, in case the value changed
-    while IFS= read -r rule; do
-        [[ -z "$rule" ]] && continue
-        del_rule="${rule/-A FORWARD/-D FORWARD}"
-        eval "iptables $del_rule" 2>/dev/null
-    done < <(iptables -S FORWARD 2>/dev/null | grep -- "-j TCPMSS")
-    while IFS= read -r rule; do
-        [[ -z "$rule" ]] && continue
-        del_rule="${rule/-A OUTPUT/-D OUTPUT}"
-        eval "iptables $del_rule" 2>/dev/null
-    done < <(iptables -S OUTPUT 2>/dev/null | grep -- "-j TCPMSS")
+    safe_iptables_delete "filter" "FORWARD" "-j TCPMSS"
+    safe_iptables_delete "filter" "OUTPUT" "-j TCPMSS"
 
     iptables -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$mss_value"
     iptables -A OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$mss_value"
@@ -416,18 +595,18 @@ apply_ttl_randomization() {
 
     modprobe xt_TTL >/dev/null 2>&1
 
+    # Always remove any previous TTL rule from this script first, so a
+    # re-run actually rotates the value instead of silently keeping the old one.
+    safe_iptables_delete "mangle" "OUTPUT" "-j TTL"
+
     local rand_ttl=$(( (RANDOM % 4) + 125 ))
 
-    if ! iptables -t mangle -C OUTPUT -j TTL --ttl-set "$rand_ttl" 2>/dev/null; then
-        if iptables -t mangle -A OUTPUT -j TTL --ttl-set "$rand_ttl" 2>/tmp/antidpi_ttl.log; then
-            mkdir -p "$STATE_DIR"
-            echo "$rand_ttl" > "$STATE_TTL_FILE"
-            log_ok "Outbound TTL set to $rand_ttl (mangle/OUTPUT)"
-        else
-            log_warn "Could not apply TTL target (xt_TTL module unavailable on this kernel - common on some minimal/container kernels). Skipping, non-fatal."
-        fi
+    if iptables -t mangle -A OUTPUT -j TTL --ttl-set "$rand_ttl" 2>/tmp/antidpi_ttl.log; then
+        mkdir -p "$STATE_DIR"
+        echo "$rand_ttl" > "$STATE_TTL_FILE"
+        log_ok "Outbound TTL set to $rand_ttl (mangle/OUTPUT) - rotated from any previous value"
     else
-        log_info "TTL mangle rule already present, skipping duplicate."
+        log_warn "Could not apply TTL target (xt_TTL module unavailable on this kernel - common on some minimal/container kernels). Skipping, non-fatal."
     fi
 }
 
@@ -437,22 +616,35 @@ apply_traffic_shaping() {
     log_step "Applying traffic shaping (jitter) on interface: $iface, port: $target_port"
 
     if ! command -v tc >/dev/null 2>&1; then
+        wait_for_apt_lock
         apt-get update -qq >/dev/null 2>&1
         apt-get install -y iproute2 >/dev/null 2>&1
     fi
 
     tc qdisc del dev "$iface" root >/dev/null 2>&1
 
-    tc qdisc add dev "$iface" root handle 1: prio
-    tc qdisc add dev "$iface" parent 1:3 handle 30: netem delay 10ms 5ms distribution normal
+    local step_ok=1
 
-    tc filter add dev "$iface" protocol ip parent 1:0 prio 3 u32 \
-        match ip sport "$target_port" 0xffff flowid 1:3
+    if ! tc qdisc add dev "$iface" root handle 1: prio 2>/tmp/antidpi_tc.log; then
+        log_warn "tc: failed to add root qdisc on $iface; see /tmp/antidpi_tc.log"
+        step_ok=0
+    fi
 
-    if [[ $? -eq 0 ]]; then
+    if [[ "$step_ok" -eq 1 ]] && ! tc qdisc add dev "$iface" parent 1:3 handle 30: netem delay 10ms 5ms distribution normal 2>>/tmp/antidpi_tc.log; then
+        log_warn "tc: failed to add netem delay qdisc on $iface; see /tmp/antidpi_tc.log"
+        step_ok=0
+    fi
+
+    if [[ "$step_ok" -eq 1 ]] && ! tc filter add dev "$iface" protocol ip parent 1:0 prio 3 u32 \
+        match ip sport "$target_port" 0xffff flowid 1:3 2>>/tmp/antidpi_tc.log; then
+        log_warn "tc: failed to add the port filter on $iface; see /tmp/antidpi_tc.log"
+        step_ok=0
+    fi
+
+    if [[ "$step_ok" -eq 1 ]]; then
         log_ok "Jitter (10ms +/- 5ms, normal distribution) applied to port ${target_port} traffic on $iface"
     else
-        log_warn "tc filter setup reported an issue (non-fatal, check 'tc qdisc show dev $iface')"
+        log_warn "Traffic shaping setup incomplete (non-fatal) - check 'tc qdisc show dev $iface' and /tmp/antidpi_tc.log"
     fi
 }
 
@@ -481,15 +673,26 @@ run_l3l4_manipulation() {
         log_warn "Invalid MSS '$mss_value' - falling back to 1360."
         mss_value=1360
     fi
+
+    local mirror_v6="no"
+    read -rp "$(echo -e "${YELLOW}Also mirror the MSS clamp to IPv6 (ip6tables)? Skipping this leaves IPv6 traffic untouched. [Y/n]: ${NC}")" v6_mirror_choice
+    [[ ! "$v6_mirror_choice" =~ ^[Nn]$ ]] && mirror_v6="yes"
     echo
 
     apply_nic_tuning "$iface"
     echo
     apply_mss_clamp "$mss_value"
     echo
+    if [[ "$mirror_v6" == "yes" ]]; then
+        apply_ipv6_mirror "$mss_value"
+        echo
+    fi
     apply_ttl_randomization
     echo
     apply_traffic_shaping "$iface" "$proxy_port"
+    echo
+    log_step "Persisting firewall rules across reboots..."
+    persist_iptables_rules
     echo
     log_ok "L3/L4 network manipulation applied successfully."
 }
@@ -513,6 +716,17 @@ deploy_noise_generator() {
         return 0
     fi
     log_step "Deploying background traffic noise generator..."
+
+    if ! command -v curl >/dev/null 2>&1; then
+        log_info "Installing curl (required by the noise generator)..."
+        wait_for_apt_lock
+        apt-get update -qq >/dev/null 2>&1
+        apt-get install -y curl >/dev/null 2>&1
+        if ! command -v curl >/dev/null 2>&1; then
+            log_err "curl could not be installed - the noise generator needs it to function. Aborting this module (nothing else changed)."
+            return 1
+        fi
+    fi
 
     cat > "$NOISE_SCRIPT" << 'NOISE_EOF'
 #!/usr/bin/env bash
@@ -616,6 +830,11 @@ check_status() {
     else
         log_warn "$SYSCTL_FILE not found"
     fi
+    if [[ -f "$EXTRA_SYSCTL_FILE" ]]; then
+        log_ok "$EXTRA_SYSCTL_FILE exists (extra hardening module active)"
+    else
+        log_info "$EXTRA_SYSCTL_FILE not present (extra hardening module not applied - optional)"
+    fi
     echo
 
     echo -e "${BOLD}-- IRQ balancing --${NC}"
@@ -647,11 +866,16 @@ check_status() {
 
     echo -e "${BOLD}-- iptables rules --${NC}"
     local current_mss
-    current_mss=$(iptables -S FORWARD 2>/dev/null | grep -oP '(?<=--set-mss )\d+' | head -n1)
+    current_mss=$(iptables -S FORWARD 2>/dev/null | sed -n 's/.*--set-mss \([0-9]\+\).*/\1/p' | head -n1)
     if [[ -n "$current_mss" ]]; then
         log_ok "MSS clamping rule present (FORWARD), value: ${current_mss} bytes"
     else
         log_warn "MSS clamping rule not found (FORWARD)"
+    fi
+    if [[ -f "$STATE_IPV6_MIRROR_FILE" ]] && command -v ip6tables >/dev/null 2>&1 && ip6tables -S FORWARD 2>/dev/null | grep -q "TCPMSS"; then
+        log_ok "IPv6 MSS mirror rule present (FORWARD)"
+    else
+        log_info "IPv6 MSS mirror not applied (optional)"
     fi
     if iptables -t mangle -S OUTPUT 2>/dev/null | grep -q "TTL"; then
         local ttl_val
@@ -659,6 +883,11 @@ check_status() {
         log_ok "TTL randomization rule present (current value: $ttl_val)"
     else
         log_warn "TTL randomization rule not found"
+    fi
+    if command -v netfilter-persistent >/dev/null 2>&1 && [[ -f /etc/iptables/rules.v4 ]]; then
+        log_ok "Rules are persisted (will survive a reboot)"
+    else
+        log_warn "iptables-persistent not detected - rules may NOT survive a reboot"
     fi
     echo
 
@@ -691,7 +920,84 @@ check_status() {
 }
 
 # ============================================================
-#  Uninstall / rollback (menu option 5)
+#  Self-update (menu option 5) — safe download, validate, replace, backup
+# ============================================================
+self_update() {
+    check_root
+    log_step "Checking for a newer version..."
+
+    if ! command -v curl >/dev/null 2>&1; then
+        wait_for_apt_lock
+        apt-get update -qq >/dev/null 2>&1
+        apt-get install -y curl >/dev/null 2>&1
+    fi
+
+    local tmp_file
+    tmp_file=$(mktemp /tmp/antidpi-update-XXXXXX.sh) || { log_err "Could not create a temp file. Aborting."; return 1; }
+
+    log_info "Downloading latest version from GitHub..."
+    if ! curl -fsSL "$UPDATE_URL" -o "$tmp_file"; then
+        log_err "Download failed (network/DNS issue?). Nothing changed - current version kept."
+        rm -f "$tmp_file"
+        return 1
+    fi
+
+    if [[ ! -s "$tmp_file" ]]; then
+        log_err "Downloaded file is empty. Aborting update - nothing changed."
+        rm -f "$tmp_file"
+        return 1
+    fi
+
+    log_info "Validating downloaded script syntax..."
+    if ! bash -n "$tmp_file" 2>/tmp/antidpi_update_syntax.log; then
+        log_err "Downloaded script FAILED syntax validation; see /tmp/antidpi_update_syntax.log"
+        log_err "This can happen if the download was truncated or GitHub is serving a bad response."
+        log_err "Nothing changed - your current, working version was NOT touched."
+        rm -f "$tmp_file"
+        return 1
+    fi
+    log_ok "Downloaded script is syntactically valid"
+
+    local current_hash new_hash
+    current_hash=$(sha256sum "$SELF_PATH" 2>/dev/null | awk '{print $1}')
+    new_hash=$(sha256sum "$tmp_file" 2>/dev/null | awk '{print $1}')
+
+    if [[ -n "$current_hash" && "$current_hash" == "$new_hash" ]]; then
+        log_ok "You already have the latest version - nothing to update."
+        rm -f "$tmp_file"
+        return 0
+    fi
+
+    mkdir -p "${STATE_DIR}/backups"
+    local backup_path="${STATE_DIR}/backups/optimize-$(date +%Y%m%d-%H%M%S).sh.bak"
+    cp -f "$SELF_PATH" "$backup_path" 2>/dev/null
+    ls -1t "${STATE_DIR}"/backups/optimize-*.sh.bak 2>/dev/null | tail -n +6 | xargs -r rm -f
+    log_info "Current version backed up to: $backup_path"
+
+    chmod +x "$tmp_file"
+
+    if ! cp -f "$tmp_file" "$SELF_PATH" 2>/dev/null; then
+        log_err "Could not overwrite $SELF_PATH (permissions/read-only filesystem?). Nothing changed."
+        rm -f "$tmp_file"
+        return 1
+    fi
+    chmod +x "$SELF_PATH"
+
+    for global_path in "$GLOBAL_CMD_A" "$GLOBAL_CMD_B"; do
+        if [[ -f "$global_path" ]]; then
+            cp -f "$tmp_file" "$global_path" 2>/dev/null && chmod +x "$global_path"
+        fi
+    done
+
+    rm -f "$tmp_file"
+    log_ok "Updated successfully. Old version backed up, new version installed and validated."
+    log_info "Restarting into the new version now..."
+    echo
+    exec "$SELF_PATH"
+}
+
+# ============================================================
+#  Uninstall / rollback (menu option 6)
 # ============================================================
 run_uninstall() {
     check_root
@@ -699,7 +1005,7 @@ run_uninstall() {
     echo
 
     log_info "Removing sysctl configs..."
-    rm -f "$SYSCTL_FILE" "$SYSCTL_FILE_LEGACY_1" "$SYSCTL_FILE_LEGACY_2"
+    rm -f "$SYSCTL_FILE" "$SYSCTL_FILE_LEGACY_1" "$SYSCTL_FILE_LEGACY_2" "$EXTRA_SYSCTL_FILE"
     sysctl --system >/dev/null 2>&1
     log_ok "sysctl reset"
 
@@ -737,23 +1043,17 @@ run_uninstall() {
     log_ok "Noise generator removed"
 
     log_info "Removing iptables rules added by this script..."
-    while IFS= read -r rule; do
-        [[ -z "$rule" ]] && continue
-        del_rule="${rule/-A FORWARD/-D FORWARD}"
-        eval "iptables $del_rule" 2>/dev/null
-    done < <(iptables -S FORWARD 2>/dev/null | grep -- "-j TCPMSS")
-    while IFS= read -r rule; do
-        [[ -z "$rule" ]] && continue
-        del_rule="${rule/-A OUTPUT/-D OUTPUT}"
-        eval "iptables $del_rule" 2>/dev/null
-    done < <(iptables -S OUTPUT 2>/dev/null | grep -- "-j TCPMSS")
-
-    while IFS= read -r rule; do
-        [[ -z "$rule" ]] && continue
-        del_rule="${rule/-A OUTPUT/-D OUTPUT}"
-        eval "iptables -t mangle $del_rule" 2>/dev/null
-    done < <(iptables -t mangle -S OUTPUT 2>/dev/null | grep -- "-j TTL")
+    safe_iptables_delete "filter" "FORWARD" "-j TCPMSS"
+    safe_iptables_delete "filter" "OUTPUT" "-j TCPMSS"
+    safe_iptables_delete "mangle" "OUTPUT" "-j TTL"
     rm -f "$STATE_TTL_FILE"
+
+    if [[ -f "$STATE_IPV6_MIRROR_FILE" ]] && command -v ip6tables >/dev/null 2>&1; then
+        safe_iptables_delete "filter" "FORWARD" "-j TCPMSS" "ip6tables"
+        safe_iptables_delete "filter" "OUTPUT" "-j TCPMSS" "ip6tables"
+        rm -f "$STATE_IPV6_MIRROR_FILE"
+        log_ok "IPv6 MSS mirror rules removed"
+    fi
 
     if command -v netfilter-persistent >/dev/null 2>&1; then
         netfilter-persistent save >/dev/null 2>&1
@@ -781,10 +1081,11 @@ main_menu() {
         echo -e "  ${CYAN}2)${NC} Apply L3/L4 Network Manipulation & MSS Splitting ${YELLOW}[RECOMMENDED]${NC}"
         echo -e "  ${CYAN}3)${NC} Deploy Background Noise Generator ${BLUE}[OPTIONAL]${NC}"
         echo -e "  ${CYAN}4)${NC} Run Comprehensive Status & Diagnostics ${YELLOW}[RECOMMENDED]${NC}"
-        echo -e "  ${CYAN}5)${NC} Uninstall & Restore Factory Defaults ${MAGENTA}[SYSTEM TOOL]${NC}"
-        echo -e "  ${CYAN}6)${NC} Exit"
+        echo -e "  ${CYAN}5)${NC} Update to Latest Version ${MAGENTA}[SYSTEM TOOL]${NC}"
+        echo -e "  ${CYAN}6)${NC} Uninstall & Restore Factory Defaults ${MAGENTA}[SYSTEM TOOL]${NC}"
+        echo -e "  ${CYAN}7)${NC} Exit"
         echo -e "${BLUE}------------------------------------------------------------${NC}"
-        read -rp "$(echo -e "${BOLD}Select [1-6]: ${NC}")" choice
+        read -rp "$(echo -e "${BOLD}Select [1-7]: ${NC}")" choice
         echo
 
         case "$choice" in
@@ -792,8 +1093,9 @@ main_menu() {
             2) run_l3l4_manipulation ;;
             3) deploy_noise_generator ;;
             4) check_status ;;
-            5) run_uninstall ;;
-            6) echo -e "${GREEN}Goodbye.${NC}"; exit 0 ;;
+            5) self_update ;;
+            6) run_uninstall ;;
+            7) echo -e "${GREEN}Goodbye.${NC}"; exit 0 ;;
             *) log_err "Invalid option." ;;
         esac
 
@@ -806,4 +1108,7 @@ main_menu() {
 #  Entry point
 # ============================================================
 check_root
+check_distro
+install_global_command
+echo
 main_menu
