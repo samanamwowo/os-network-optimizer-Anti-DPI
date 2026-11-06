@@ -37,8 +37,8 @@ All changes are written to standard, well-known locations (`/etc/sysctl.d/`, `sy
 ```bash
 git clone https://github.com/samanamwowo/os-network-optimizer-Anti-DPI.git
 cd os-network-optimizer-Anti-DPI
-chmod +x optimize.sh
-sudo ./optimize.sh
+chmod +x Optimize.sh
+sudo ./Optimize.sh
 ```
 
 The global command `anti-dpi` is installed automatically the moment the script starts â€” regardless of which menu option you pick first. From then on:
@@ -50,11 +50,11 @@ sudo anti-dpi
 âš ï¸ **Manual updates:** always fetch fresh with `curl` and never paste the script's contents directly into a terminal editor (`nano`/`vi`) over SSH from a mobile client â€” long manual pastes can silently truncate heredocs and break the script. (Or just use menu option 5 â€” see below.)
 
 ```bash
-rm -f optimize.sh
-curl -fsSL https://raw.githubusercontent.com/samanamwowo/os-network-optimizer-Anti-DPI/refs/heads/main/optimize.sh -o optimize.sh
-bash -n optimize.sh && echo "File is valid"
-chmod +x optimize.sh
-sudo ./optimize.sh
+rm -f Optimize.sh
+curl -fsSL https://raw.githubusercontent.com/samanamwowo/os-network-optimizer-Anti-DPI/refs/heads/main/Optimize.sh -o Optimize.sh
+bash -n Optimize.sh && echo "File is valid"
+chmod +x Optimize.sh
+sudo ./Optimize.sh
 ```
 
 âš ï¸ **Note on automation:** several options ask interactive questions (proxy port, MSS value, whether to disable TCP timestamps/IPv6, confirmation before touching NIC offload on low-core hosts). The script cannot be driven fully unattended (e.g. `curl | sudo bash`) â€” it expects a terminal to answer prompts on. This is intentional: these values genuinely depend on your setup and hardware.
